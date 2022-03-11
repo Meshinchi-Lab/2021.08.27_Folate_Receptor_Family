@@ -1,0 +1,301 @@
+---
+title: "FOLR2 and FOLR3 Expression in pAML"
+author: "Jenny Smith"
+date: "9/28/21"
+output: html_document
+---
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2021.08.27_Folate_Receptor_Family"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+library(patchwork)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+# library(DeGSEA)
+library(REDCapR)
+# library(keyring) #cannot install non-zero exit 
+
+getwd()
+```
+
+
+#Raw Counts
+
+```{r}
+current_files <- dir(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/"))
+# current_files
+```
+
+```{r}
+cts_grch38_file <- grep("_RBD_.+scaledTPM_counts.RDS", current_files, value=TRUE)
+cts_grch38 <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/",cts_grch38_file))
+cts_grch38_ids <- cts_grch38[,grep("gene_id","gene_name")]
+
+
+head(cts_grch38[,1:5])
+dim(cts_grch38) #58263  3023
+```
+
+```{r}
+TPM_grch38_file <- grep("_RBD_.+Abundance_TPM", current_files, value=TRUE)
+TPM_grch38 <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/",TPM_grch38_file))
+TPM_grch38_ids <- TPM_grch38[,grep("gene_id|gene_name", colnames(TPM_grch38))]
+
+TPM_grch38 <- as.data.frame(TPM_grch38)
+rownames(TPM_grch38) <-  TPM_grch38_ids$gene_name
+TPM_grch38 <- TPM_grch38[,-grep("gene_id|gene_name", colnames(TPM_grch38))]
+
+
+head(TPM_grch38)
+dim(TPM_grch38) #58263  3021
+```
+
+# ClinData
+
+```{r message=FALSE}
+#https://cran.r-project.org/web/packages/REDCapR/vignettes/workflow-read.html 
+project <- "FOLR2_FOLR3_Gene_Expression"
+
+current_cde_database <- paste("TARGET_AML_CDEs_For_Project",project, ".RDS", sep="_")
+
+if(file.exists(current_cde_database)){
+  merged <- readRDS(current_cde_database)
+    
+}else{
+  path_credential <- file.path(HOME,".redcap")
+  project_id <- 1295
+
+  credential  <- REDCapR::retrieve_credential_local(
+    path_credential = path_credential,
+    project_id = project_id)
+  
+  #takes about 30 sec to download. 
+  merged <- redcap_read(redcap_uri = credential$redcap_uri, 
+                        token = credential$token, 
+                        raw_or_label_headers = 'label')
+  if(merged$success){
+    merged <- data.frame(merged$data, check.names=TRUE) #remove the white spaces  (will this even work??)
+    saveRDS(merged, current_cde_database)
+  }
+  
+}
+
+#keep a list of the ineligable patiens to remove if necessary
+inelig <- merged %>% 
+  filter(Eligibility.Comments == "remove") %>% 
+  pull(USI)
+
+#Filter those with USIs and are eligible for the study
+merged <- merged %>% 
+  filter(!is.na(USI), !grepl("Unknown", USI)) %>% 
+  filter(Eligibility.Comments != "remove")
+
+
+dim(merged) #2217  156
+head(merged)
+```
+
+```{r}
+#Need to compare the redCap CDEs and the May 21st version the CDEs
+# colnames(merged)
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_08.12.21.csv")) 
+
+dim(sample_info)
+```
+
+
+
+
+# Select Samples 
+
+```{r}
+selected_samples <- sample_info %>% 
+  filter(grepl("NBM|CD34_PB|diagnostic", Time_point), 
+         grepl("NBM|CD34_PB|^AML$", Group)) %>% 
+  filter(!grepl("_replicate", Sample)) %>% 
+  filter(Sample %in% colnames(TPM_grch38))
+
+
+
+table(selected_samples$Group)
+table(selected_samples$AML_Subtype)
+
+# write.csv(selected_samples,paste0("TARGET_AML_Sample_Manifest_",project,".csv"))
+```
+
+# Expression Plots 
+
+```{r}
+goi <- TPM_grch38_ids  %>% 
+  filter(grepl("FOLR[23]$", gene_name))
+```
+
+```{r}
+FOLR2_FOLR3 <- TPM_grch38[c("FOLR2","FOLR3"), selected_samples$Sample] %>% 
+  rownames_to_column("gene_name") %>% 
+  pivot_longer(cols=matches("^TARGET"), names_to="Sample", values_to="TPM") %>% 
+  mutate(log2_TPM=log2(TPM+1)) %>% 
+  left_join(., selected_samples, by="Sample") %>% 
+  mutate(Group=factor(Group,levels=c("AML","NBM","CD34_PB")))
+
+
+head(FOLR2_FOLR3)
+```
+
+## Summary Stats 
+
+```{r}
+FOLR2_FOLR3.stats <- FOLR2_FOLR3 %>% 
+  group_by(gene_name, Group) %>% 
+  summarize(min=min(TPM),
+            Q1=quantile(TPM, probs = c(0.25)),
+            median=median(TPM),
+            Q3=quantile(TPM, probs=c(0.75)),
+            # perc90th=quantile(TPM, probs = c(0.90)),
+            mean=mean(TPM),
+            max=max(TPM),
+            percent_expressors=round((sum(TPM >= 1.0)/n())*100, digits = 2)) %>%
+  # mutate(range=max-min) %>%
+  ungroup() %>% 
+  pivot_longer(cols=min:percent_expressors, names_to="statistic",values_to="value") %>% 
+  mutate_at(vars(value), ~round(., digits = 2)) %>% 
+  mutate_at(vars(statistic), ~ifelse(grepl("percent", .), paste(.,"(%)"),paste(., "(TPM)")))
+  # pivot_wider(id_cols=gene_name,
+  #             names_from=Group, 
+  #             values_from=min:Range,
+  #             names_glue="{Group}_{.value}") %>% 
+  # rename_at(vars(matches("AML|CD34PB|NBM")),~paste0(.,"_TPM")) %>% 
+  # select(colnames(.)[order(colnames(.))]) %>% 
+  # select(gene_name,everything())
+
+# head(FOLR2_FOLR3.stats)
+```
+
+## Plots 
+
+```{r fig.width=12, fig.height=6}
+boxplots <- ggplot(FOLR2_FOLR3, aes(x=Group, y=TPM, fill=Group)) +
+  # ggbeeswarm::geom_beeswarm() +
+  # geom_boxplot() +
+  geom_point(color="grey40", 
+             shape=21, alpha=0.75, 
+             size=2,
+             position = position_jitterdodge(jitter.width = 2.0)) +
+  geom_violin(scale="width", alpha=0.2) +
+  
+  facet_wrap(~gene_name, scale="free_y") +
+  theme_classic() +
+  theme(legend.position = "top",
+        axis.text = element_text(size=14,color="black"),
+        axis.title = element_text(size=20, color="black"),
+        axis.title.x = element_blank(),
+        strip.text = element_text(size=14))
+
+
+# boxplots
+```
+
+```{r fig.width=12, fig.height=6}
+summary_stats <- ggplot(FOLR2_FOLR3.stats, aes(x=Group,y=statistic, color=Group, label=value)) +
+  geom_text(size=5) +
+  facet_wrap(~gene_name) + 
+  theme_classic() +
+  theme(axis.title = element_text(size=20, color="black"), 
+        axis.text = element_text(size=14,color="black"),
+        axis.title.x = element_blank()) +
+  theme(legend.position = "none")
+
+# summary_stats
+```
+
+```{r fig.width=15, fig.height=10}
+# pdf("TARGET_AML_FOLR2_FOLR2_Expression_violinplots_summary_stats.pdf", width = 15, height = 10)
+boxplots / summary_stats + plot_layout(heights = c(0.6, 0.4))
+# dev.off()
+```
+
+
+```{r fig.height=8, fig.width=10}
+stat.plot <- ggsummarystats(FOLR2_FOLR3, x = "Group", y = "TPM", 
+  ggfunc = ggbarplot, 
+  facet.by="gene_name",
+  add = c("jitter", "median_iqr"), 
+  summaries = c("n","q1", "median","q3","max", "iqr"),
+  position = position_dodge(),
+  color = "Group", 
+  palette = "npg",
+  heights = c(0.70, 0.3),
+  table.font.size=100,
+  alpha=0.5
+) 
+
+# stat.plot
+```
+
+
+## High Expressors in pAML
+
+```{r}
+High_Expressor_Samples <- FOLR2_FOLR3 %>% 
+  filter(Group=="AML") %>% 
+  group_by(gene_name) %>% 
+  arrange(desc(TPM)) %>% 
+  slice(1:15) %>% 
+  ungroup() 
+
+
+High_Expressors <- FOLR2_FOLR3 %>% 
+  filter(Sample %in% High_Expressor_Samples$Sample) %>% 
+  select(gene_name:TPM,USI, Primary.Fusion) %>% 
+  arrange(gene_name, desc(round(TPM, digits = 0)), Primary.Fusion) %>% 
+  pivot_wider(id_cols=c(Sample,USI, Primary.Fusion),
+              names_from=gene_name, 
+              values_from=TPM) %>% 
+  rename_at(vars(FOLR2,FOLR3), ~paste0(., "_TPM")) %>% 
+  mutate(Sample_Expresses_Highly=c(rep("high FOLR2", 15), rep("high FOLR3", 15)))
+
+
+High_Expressors
+# write.csv(High_Expressors,"TARGET_AML_Top15_FOLR2_FOLR3_Expressors.csv", row.names = FALSE)
+```
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
